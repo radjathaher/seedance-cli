@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+
 jobs:
   build:
     name: build ${{ matrix.asset }}
@@ -31,7 +34,16 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build
-        run: cargo build --locked --release --target '${{ matrix.target }}'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if cargo build --locked --release --target '${{ matrix.target }}'; then
+              exit 0
+            fi
+            sleep "$((attempt * 10))"
+          done
+          cargo build --locked --release --target '${{ matrix.target }}'
       - name: Package
         shell: bash
         run: |

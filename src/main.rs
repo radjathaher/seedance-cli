@@ -684,7 +684,7 @@ fn print_json(value: &Value, pretty: bool) -> Result<()> {
 }
 
 fn print_pricing() -> Result<()> {
-    println!("Seedance 2.0 Segmind reference pricing, USD/sec.");
+    println!("Seedance 2.0 price cards, USD/sec.");
     println!(
         "Multiply text/image-to-video rates by output duration. Video-to-video also depends on reference-video tokens."
     );
@@ -792,7 +792,8 @@ fn print_pricing() -> Result<()> {
 }
 
 fn print_text_image_rates(model: &str, rows: &[(&str, [&str; 6])]) {
-    println!("{model} text/image-to-video per-second rates");
+    println!("================ {model} price card ================");
+    println!("text/image-to-video per-second rates");
     println!("resolution,16:9,4:3,1:1,3:4,9:16,21:9");
     for (resolution, rates) in rows {
         println!(
