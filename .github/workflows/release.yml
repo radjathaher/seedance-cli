@@ -78,8 +78,8 @@ jobs:
             echo "no release assets found" >&2
             exit 1
           fi
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "${assets[@]}" --clobber
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$TAG" "${assets[@]}" --title "$TAG" --generate-notes
+            gh release create "$TAG" "${assets[@]}" --title "$TAG" --generate-notes --repo "$GITHUB_REPOSITORY"
           fi
