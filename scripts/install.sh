@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-version="${SEEDANCE_CLI_VERSION:-0.1.0}"
+version="${SEEDANCE_CLI_VERSION:-0.2.0}"
 os="$(uname -s)"
 arch="$(uname -m)"
 case "$os-$arch" in

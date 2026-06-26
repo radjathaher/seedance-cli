@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -27,7 +27,7 @@ fn main() {
     version,
     about = "Seedance 2.0 CLI for Segmind video generation",
     long_about = "Seedance 2.0 CLI for Segmind video generation.\n\nDefault flow: upload local references, submit an async Seedance job, poll until completion, and download the generated video to --out.",
-    after_help = "Examples:\n  seedance generate --prompt \"Neon city at night\" --speed fast --resolution 480p --duration-seconds 4 --out video.mp4\n  seedance generate --prompt \"Animate this\" --image ./ref.png --out video.mp4\n  seedance generate --prompt \"Batch job\" --no-wait --pretty\n  seedance task wait --task-id req_123 --out video.mp4"
+    after_help = "Examples:\n  seedance generate --prompt \"Neon city at night\" --model mini --resolution 720p --duration-seconds 5 --out video.mp4\n  seedance generate --prompt \"Animate this\" --first-frame ./ref.png --out video.mp4\n  seedance generate --prompt \"Batch job\" --no-wait --pretty\n  seedance task wait --task-id req_123 --out video.mp4"
 )]
 struct Cli {
     #[arg(long, global = true, default_value = DEFAULT_BASE_URL, help = "Segmind API base URL")]
@@ -61,9 +61,11 @@ enum Commands {
 struct GenerateArgs {
     #[arg(long, help = "Text prompt")]
     prompt: String,
-    #[arg(long, value_enum, default_value_t = Speed::Fast, help = "Seedance model speed")]
-    speed: Speed,
-    #[arg(long, value_enum, default_value_t = Resolution::R480p, help = "Output resolution")]
+    #[arg(long, value_enum, help = "Seedance model")]
+    model: Option<Model>,
+    #[arg(long, value_enum, help = "Deprecated alias for --model fast|standard")]
+    speed: Option<Speed>,
+    #[arg(long, value_enum, default_value_t = Resolution::R720p, help = "Output resolution")]
     resolution: Resolution,
     #[arg(
         long,
@@ -94,10 +96,29 @@ struct GenerateArgs {
     audios: Vec<String>,
     #[arg(
         long,
-        default_value_t = false,
+        help = "Starting frame image URL or local path; cannot combine with --image"
+    )]
+    first_frame: Option<String>,
+    #[arg(
+        long,
+        help = "Ending frame image URL or local path; requires --first-frame"
+    )]
+    last_frame: Option<String>,
+    #[arg(
+        long,
+        default_value_t = true,
+        action = ArgAction::SetTrue,
         help = "Ask Seedance to generate audio when supported"
     )]
     generate_audio: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        action = ArgAction::SetTrue,
+        conflicts_with = "generate_audio",
+        help = "Disable provider-generated synchronized audio"
+    )]
+    no_generate_audio: bool,
     #[arg(long, default_value_t = -1, help = "Seed; -1 lets provider choose")]
     seed: i64,
     #[arg(
@@ -108,10 +129,11 @@ struct GenerateArgs {
     return_last_frame: bool,
     #[arg(
         long,
-        default_value = "false",
+        default_value_t = false,
+        action = ArgAction::SetTrue,
         help = "Provider moderation flag passed through to Segmind"
     )]
-    skip_moderation: String,
+    skip_moderation: bool,
     #[arg(long, help = "Write generated video to this path")]
     out: Option<PathBuf>,
     #[arg(long, default_value_t = 2, help = "Polling interval in seconds")]
@@ -168,18 +190,34 @@ struct TaskWaitArgs {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
-enum Speed {
+enum Model {
+    Mini,
     Fast,
     Standard,
 }
 
-impl Speed {
+impl Model {
     fn slug(self) -> &'static str {
         match self {
-            Speed::Fast => "seedance-2.0-fast",
-            Speed::Standard => "seedance-2.0",
+            Model::Mini => "seedance-2.0-mini",
+            Model::Fast => "seedance-2.0-fast",
+            Model::Standard => "seedance-2.0",
         }
     }
+
+    fn label(self) -> &'static str {
+        match self {
+            Model::Mini => "Seedance 2.0 Mini",
+            Model::Fast => "Seedance 2.0 Fast",
+            Model::Standard => "Seedance 2.0 Standard",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum Speed {
+    Fast,
+    Standard,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq, Serialize)]
@@ -193,6 +231,9 @@ enum Resolution {
     #[value(name = "1080p")]
     #[serde(rename = "1080p")]
     R1080p,
+    #[value(name = "4k")]
+    #[serde(rename = "4k")]
+    R4k,
 }
 
 impl Resolution {
@@ -201,6 +242,7 @@ impl Resolution {
             Resolution::R480p => "480p",
             Resolution::R720p => "720p",
             Resolution::R1080p => "1080p",
+            Resolution::R4k => "4k",
         }
     }
 }
@@ -360,11 +402,14 @@ fn run() -> Result<()> {
 }
 
 fn handle_generate(api: &ApiClient, args: GenerateArgs, pretty: bool, raw: bool) -> Result<()> {
-    validate_generate(&args)?;
+    let model = resolve_model(&args)?;
+    validate_generate(&args, model)?;
     let reference_images = upload_refs(api, &args.images, 9, "images")?;
     let reference_videos = upload_refs(api, &args.videos, 3, "videos")?;
     let reference_audios = upload_refs(api, &args.audios, 3, "audios")?;
-    let body = json!({
+    let first_frame_url = upload_optional_ref(api, args.first_frame.as_deref())?;
+    let last_frame_url = upload_optional_ref(api, args.last_frame.as_deref())?;
+    let mut body = json!({
         "prompt": args.prompt,
         "reference_images": reference_images,
         "reference_videos": reference_videos,
@@ -372,12 +417,18 @@ fn handle_generate(api: &ApiClient, args: GenerateArgs, pretty: bool, raw: bool)
         "duration": args.duration_seconds,
         "resolution": args.resolution.as_str(),
         "aspect_ratio": args.aspect_ratio,
-        "generate_audio": args.generate_audio,
+        "generate_audio": args.generate_audio && !args.no_generate_audio,
         "seed": args.seed,
         "return_last_frame": args.return_last_frame,
         "skip_moderation": args.skip_moderation,
     });
-    let submit = api.submit(args.speed.slug(), body)?;
+    if let Some(first_frame_url) = first_frame_url {
+        body["first_frame_url"] = json!(first_frame_url);
+    }
+    if let Some(last_frame_url) = last_frame_url {
+        body["last_frame_url"] = json!(last_frame_url);
+    }
+    let submit = api.submit(model.slug(), body)?;
     if args.no_wait {
         return print_json(&serde_json::to_value(submit)?, pretty);
     }
@@ -408,9 +459,35 @@ fn handle_generate(api: &ApiClient, args: GenerateArgs, pretty: bool, raw: bool)
     }
 }
 
-fn validate_generate(args: &GenerateArgs) -> Result<()> {
-    if args.speed == Speed::Fast && args.resolution == Resolution::R1080p {
-        bail!("Seedance 2.0 Fast supports 480p or 720p, not 1080p");
+fn resolve_model(args: &GenerateArgs) -> Result<Model> {
+    match (args.model, args.speed) {
+        (Some(_), Some(_)) => bail!("use either --model or deprecated --speed, not both"),
+        (Some(model), None) => Ok(model),
+        (None, Some(Speed::Fast)) => Ok(Model::Fast),
+        (None, Some(Speed::Standard)) => Ok(Model::Standard),
+        (None, None) => Ok(Model::Mini),
+    }
+}
+
+fn validate_generate(args: &GenerateArgs, model: Model) -> Result<()> {
+    match (model, args.resolution) {
+        (Model::Mini | Model::Fast, Resolution::R1080p | Resolution::R4k) => {
+            bail!(
+                "{} supports 480p or 720p, not {}",
+                model.label(),
+                args.resolution.as_str()
+            )
+        }
+        _ => {}
+    }
+    if !matches!(args.duration_seconds, 4 | 5 | 6 | 8 | 10 | 12 | 15) {
+        bail!("--duration-seconds must be one of 4, 5, 6, 8, 10, 12, 15");
+    }
+    if args.first_frame.is_some() && !args.images.is_empty() {
+        bail!("--first-frame cannot be combined with --image; use one image-to-video mode");
+    }
+    if args.last_frame.is_some() && args.first_frame.is_none() {
+        bail!("--last-frame requires --first-frame");
     }
     validate_count(&args.images, 9, "images")?;
     validate_count(&args.videos, 3, "videos")?;
@@ -419,6 +496,10 @@ fn validate_generate(args: &GenerateArgs) -> Result<()> {
         bail!("--out is required unless --no-wait is set");
     }
     Ok(())
+}
+
+fn upload_optional_ref(api: &ApiClient, value: Option<&str>) -> Result<Option<String>> {
+    value.map(|value| api.upload_one(value)).transpose()
 }
 
 fn validate_count(values: &[String], max: usize, name: &str) -> Result<()> {
@@ -603,16 +684,141 @@ fn print_json(value: &Value, pretty: bool) -> Result<()> {
 }
 
 fn print_pricing() -> Result<()> {
+    println!("Seedance 2.0 Segmind reference pricing, USD/sec.");
     println!(
-        "Seedance 2.0 Segmind reference pricing notes, USD/sec; video-input is billed on input+output duration."
+        "Multiply text/image-to-video rates by output duration. Video-to-video also depends on reference-video tokens."
     );
-    println!("speed,resolution,no_video,with_video");
-    println!("fast,480p,0.0538-0.0562,0.0317-0.0331");
-    println!("fast,720p,0.1210-0.1217,0.0713-0.0717");
-    println!("standard,480p,0.0672-0.0703,0.0413-0.0432");
-    println!("standard,720p,0.1512-0.1522,0.0929-0.0935");
-    println!("standard,1080p,unverified,unverified");
+    println!();
+    print_text_image_rates(
+        "mini",
+        &[
+            (
+                "480p",
+                ["0.0352", "0.0345", "0.0336", "0.0345", "0.0352", "0.0352"],
+            ),
+            (
+                "720p",
+                ["0.0756", "0.0761", "0.0756", "0.0761", "0.0756", "0.0760"],
+            ),
+        ],
+    );
+    print_video_rates(
+        "mini",
+        &[
+            ("480p", "~0.045", "0.035-0.065"),
+            ("720p", "~0.095", "0.08-0.12"),
+        ],
+    );
+    print_examples(
+        "mini",
+        &[
+            ("Text / Image-to-video", "480p", "16:9", "5s", "0.18"),
+            ("Text / Image-to-video", "720p", "16:9", "5s", "0.38"),
+            ("Text / Image-to-video", "720p", "16:9", "10s", "0.76"),
+            ("Text / Image-to-video", "480p", "16:9", "15s", "0.53"),
+            ("Video-to-video", "480p", "16:9", "5s", "~0.22"),
+            ("Video-to-video", "720p", "16:9", "5s", "~0.47"),
+        ],
+    );
+    print_text_image_rates(
+        "fast",
+        &[
+            (
+                "480p",
+                ["0.0562", "0.0553", "0.0538", "0.0553", "0.0562", "0.0562"],
+            ),
+            (
+                "720p",
+                ["0.1210", "0.1217", "0.1210", "0.1217", "0.1210", "0.1216"],
+            ),
+        ],
+    );
+    print_video_rates(
+        "fast",
+        &[
+            ("480p", "~0.06", "0.055-0.08"),
+            ("720p", "~0.13", "0.12-0.17"),
+        ],
+    );
+    print_examples(
+        "fast",
+        &[
+            ("Text / Image-to-video", "480p", "16:9", "5s", "0.28"),
+            ("Text / Image-to-video", "720p", "16:9", "5s", "0.60"),
+            ("Text / Image-to-video", "720p", "16:9", "10s", "1.21"),
+            ("Video-to-video", "480p", "16:9", "5s", "~0.30"),
+            ("Video-to-video", "720p", "16:9", "5s", "~0.65"),
+        ],
+    );
+    print_text_image_rates(
+        "standard",
+        &[
+            (
+                "480p",
+                ["0.0703", "0.0691", "0.0672", "0.0691", "0.0703", "0.0703"],
+            ),
+            (
+                "720p",
+                ["0.1512", "0.1522", "0.1512", "0.1522", "0.1512", "0.1519"],
+            ),
+            ("1080p", ["0.34", "0.34", "0.34", "0.34", "0.34", "0.34"]),
+            (
+                "4k",
+                ["1.3721", "1.3721", "1.3721", "1.3721", "1.3721", "1.3721"],
+            ),
+        ],
+    );
+    print_video_rates(
+        "standard",
+        &[
+            ("480p", "~0.09", "0.07-0.13"),
+            ("720p", "~0.19", "0.16-0.25"),
+            ("1080p", "~0.41", "0.35-0.50"),
+        ],
+    );
+    print_examples(
+        "standard",
+        &[
+            ("Text / Image-to-video", "480p", "16:9", "5s", "0.35"),
+            ("Text / Image-to-video", "720p", "16:9", "5s", "0.76"),
+            ("Text / Image-to-video", "720p", "16:9", "10s", "1.51"),
+            ("Text / Image-to-video", "1080p", "16:9", "5s", "1.70"),
+            ("Text / Image-to-video", "4k", "16:9", "5s", "6.86"),
+            ("Video-to-video", "480p", "16:9", "5s", "~0.45"),
+            ("Video-to-video", "720p", "16:9", "5s", "~0.95"),
+        ],
+    );
     Ok(())
+}
+
+fn print_text_image_rates(model: &str, rows: &[(&str, [&str; 6])]) {
+    println!("{model} text/image-to-video per-second rates");
+    println!("resolution,16:9,4:3,1:1,3:4,9:16,21:9");
+    for (resolution, rates) in rows {
+        println!(
+            "{resolution},{},{},{},{},{},{}",
+            rates[0], rates[1], rates[2], rates[3], rates[4], rates[5]
+        );
+    }
+    println!();
+}
+
+fn print_video_rates(model: &str, rows: &[(&str, &str, &str)]) {
+    println!("{model} video-to-video typical rates");
+    println!("resolution,typical,range");
+    for (resolution, typical, range) in rows {
+        println!("{resolution},{typical},{range}");
+    }
+    println!();
+}
+
+fn print_examples(model: &str, rows: &[(&str, &str, &str, &str, &str)]) {
+    println!("{model} quick cost examples");
+    println!("input_type,resolution,aspect_ratio,duration,cost_usd");
+    for (input_type, resolution, aspect_ratio, duration, cost) in rows {
+        println!("{input_type},{resolution},{aspect_ratio},{duration},{cost}");
+    }
+    println!();
 }
 
 #[cfg(test)]
@@ -620,32 +826,88 @@ mod tests {
     use super::*;
 
     #[test]
-    fn speed_to_slug() {
-        assert_eq!(Speed::Fast.slug(), "seedance-2.0-fast");
-        assert_eq!(Speed::Standard.slug(), "seedance-2.0");
+    fn model_to_slug() {
+        assert_eq!(Model::Mini.slug(), "seedance-2.0-mini");
+        assert_eq!(Model::Fast.slug(), "seedance-2.0-fast");
+        assert_eq!(Model::Standard.slug(), "seedance-2.0");
     }
 
     #[test]
-    fn fast_rejects_1080p() {
-        let args = GenerateArgs {
-            prompt: "x".into(),
-            speed: Speed::Fast,
-            resolution: Resolution::R1080p,
-            duration_seconds: 4,
-            aspect_ratio: "16:9".into(),
-            images: vec![],
-            videos: vec![],
-            audios: vec![],
-            generate_audio: false,
-            seed: -1,
-            return_last_frame: false,
-            skip_moderation: "false".into(),
-            out: Some(PathBuf::from("x.mp4")),
-            poll_interval_secs: 1,
-            max_wait_secs: 1,
-            no_wait: false,
+    fn default_model_is_mini() {
+        let args = base_args();
+        assert_eq!(resolve_model(&args).unwrap(), Model::Mini);
+    }
+
+    #[test]
+    fn speed_alias_resolves_to_model() {
+        let mut args = base_args();
+        args.speed = Some(Speed::Fast);
+        assert_eq!(resolve_model(&args).unwrap(), Model::Fast);
+    }
+
+    #[test]
+    fn mini_rejects_1080p() {
+        let mut args = base_args();
+        args.resolution = Resolution::R1080p;
+        assert!(validate_generate(&args, Model::Mini).is_err());
+    }
+
+    #[test]
+    fn standard_accepts_4k() {
+        let mut args = base_args();
+        args.model = Some(Model::Standard);
+        args.resolution = Resolution::R4k;
+        assert!(validate_generate(&args, Model::Standard).is_ok());
+    }
+
+    #[test]
+    fn rejects_unsupported_duration() {
+        let mut args = base_args();
+        args.duration_seconds = 7;
+        assert!(validate_generate(&args, Model::Mini).is_err());
+    }
+
+    #[test]
+    fn first_frame_rejects_reference_images() {
+        let mut args = base_args();
+        args.first_frame = Some("https://example.com/start.png".into());
+        args.images = vec!["https://example.com/ref.png".into()];
+        assert!(validate_generate(&args, Model::Mini).is_err());
+    }
+
+    #[test]
+    fn last_frame_requires_first_frame() {
+        let mut args = base_args();
+        args.last_frame = Some("https://example.com/end.png".into());
+        assert!(validate_generate(&args, Model::Mini).is_err());
+    }
+
+    #[test]
+    fn cli_defaults_to_audio_on() {
+        let cli =
+            Cli::try_parse_from(["seedance", "generate", "--prompt", "x", "--no-wait"]).unwrap();
+        let Commands::Generate(args) = cli.command else {
+            panic!("expected generate command");
         };
-        assert!(validate_generate(&args).is_err());
+        assert!(args.generate_audio);
+        assert!(!args.no_generate_audio);
+    }
+
+    #[test]
+    fn cli_accepts_audio_off() {
+        let cli = Cli::try_parse_from([
+            "seedance",
+            "generate",
+            "--prompt",
+            "x",
+            "--no-generate-audio",
+            "--no-wait",
+        ])
+        .unwrap();
+        let Commands::Generate(args) = cli.command else {
+            panic!("expected generate command");
+        };
+        assert!(args.no_generate_audio);
     }
 
     #[test]
@@ -664,5 +926,30 @@ mod tests {
             first_uploaded_url(&response).as_deref(),
             Some("https://images.segmind.com/assets/a.png")
         );
+    }
+
+    fn base_args() -> GenerateArgs {
+        GenerateArgs {
+            prompt: "x".into(),
+            model: None,
+            speed: None,
+            resolution: Resolution::R720p,
+            duration_seconds: 5,
+            aspect_ratio: "16:9".into(),
+            images: vec![],
+            videos: vec![],
+            audios: vec![],
+            first_frame: None,
+            last_frame: None,
+            generate_audio: true,
+            no_generate_audio: false,
+            seed: -1,
+            return_last_frame: false,
+            skip_moderation: false,
+            out: Some(PathBuf::from("x.mp4")),
+            poll_interval_secs: 1,
+            max_wait_secs: 1,
+            no_wait: false,
+        }
     }
 }
